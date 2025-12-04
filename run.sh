@@ -2,6 +2,7 @@
 set -e
 
 DRY_RUN=false
+LOG_FILE="sop-log-$(date +%Y%m%d-%H%M%S).txt"
 
 # Detect --dry-run flag
 for arg in "$@"; do
@@ -11,24 +12,37 @@ for arg in "$@"; do
     fi
 done
 
-# Function to run or print commands
+# Function: run command + log output
 run_cmd() {
-    echo "------------------------------------------------------------"
-    echo "➡️ Command:"
-    echo "$1"
-    echo "------------------------------------------------------------"
+    echo "------------------------------------------------------------" | tee -a "$LOG_FILE"
+    echo "➡️ Command: $1" | tee -a "$LOG_FILE"
+    echo "------------------------------------------------------------" | tee -a "$LOG_FILE"
 
-    if [ "$DRY_RUN" = false ]; then
-        eval "$1"
+    if [ "$DRY_RUN" = true ]; then
+        echo "🟡 DRY RUN: Command NOT executed." | tee -a "$LOG_FILE"
+        return
+    fi
+
+    # Execute command AND capture output
+    OUTPUT=$(eval "$1" 2>&1)
+    STATUS=$?
+
+    echo "$OUTPUT" | tee -a "$LOG_FILE"
+
+    if [ $STATUS -ne 0 ]; then
+        echo "❌ ERROR running: $1" | tee -a "$LOG_FILE"
+        echo "Output:" | tee -a "$LOG_FILE"
+        echo "$OUTPUT" | tee -a "$LOG_FILE"
     else
-        echo "🟡 DRY RUN: Command NOT executed."
+        echo "✅ SUCCESS" | tee -a "$LOG_FILE"
     fi
 }
 
-echo "==============================================="
-echo "🚀 BEGIN WORDPRESS SOP SCRIPT"
-echo "Dry Run Mode: $DRY_RUN"
-echo "==============================================="
+echo "===============================================" | tee -a "$LOG_FILE"
+echo "🚀 BEGIN WORDPRESS SOP SCRIPT" | tee -a "$LOG_FILE"
+echo "Dry Run Mode: $DRY_RUN" | tee -a "$LOG_FILE"
+echo "Log File: $LOG_FILE" | tee -a "$LOG_FILE"
+echo "===============================================" | tee -a "$LOG_FILE"
 
 ########################################
 # 1️⃣ Create New Admin & Delete Others
@@ -62,14 +76,14 @@ run_cmd 'echo "RewriteRule ^wp-content/uploads/.*\.php$ - [F,L]" >> .htaccess'
 run_cmd 'rm -rf wp-content/litespeed-cache/*'
 
 ########################################
-# 5️⃣ Malware Scan
+# 5️⃣ Malware Scan (Improved)
 ########################################
 run_cmd 'echo "=== SCAN: PHP FILES IN UPLOADS ===" > scan-output.txt'
 run_cmd 'find wp-content/uploads -type f -name "*.php" >> scan-output.txt'
 run_cmd 'echo -e "\n=== SCAN: RECENTLY MODIFIED PHP FILES ===" >> scan-output.txt'
 run_cmd 'find . -type f -name "*.php" -mtime -7 >> scan-output.txt'
 run_cmd 'echo -e "\n=== SCAN: SUSPICIOUS FUNCTIONS ===" >> scan-output.txt'
-run_cmd 'grep -RIn --color=never -E "base64_decode|eval\(|gzinflate|str_rot13|shell_exec|passthru|system\(" . >> scan-output.txt'
+run_cmd 'grep -RIn --color=never -E "base64_decode|eval\(|gzinflate|str_rot13|shell_exec|passthru|system\(" . | grep -v "scan-output.txt" >> scan-output.txt'
 run_cmd 'echo -e "\n=== SCAN: 777 PERMISSION FILES ===" >> scan-output.txt'
 run_cmd 'find . -type f -perm 0777 >> scan-output.txt'
 run_cmd 'echo -e "\n=== SCAN COMPLETE ===" >> scan-output.txt'
@@ -88,18 +102,24 @@ run_cmd 'rm -rf mu-plugins/*'
 run_cmd 'wget -O mu-plugins/abj_datalayers.php https://raw.githubusercontent.com/abjventuresinc/custom-datalayer-mu-plugin/main/abj_datalayers.php'
 
 ########################################
-# 8️⃣ Install Wordfence
+# 8️⃣ Install + ACTIVATE Wordfence (Improved)
 ########################################
 run_cmd 'cd /var/www/vhosts/localhost/html'
-run_cmd 'wp plugin install wordfence --activate --allow-root'
+run_cmd 'wp plugin install wordfence --allow-root'
+
+# Explicit activation with logging
+run_cmd 'wp plugin activate wordfence --allow-root'
 
 ########################################
-# ✔ AIOM + AIOS3 (Optional)
+# ✔ Install + Activate AIOM + AIOS3 (Improved)
 ########################################
-run_cmd 'wp plugin install https://raw.githubusercontent.com/abjventuresinc/custom-datalayer-mu-plugin/main/AIOM.zip --activate --allow-root'
-run_cmd 'wp plugin install https://raw.githubusercontent.com/abjventuresinc/custom-datalayer-mu-plugin/main/AIOS3.zip --activate --allow-root'
+run_cmd 'wp plugin install https://raw.githubusercontent.com/abjventuresinc/custom-datalayer-mu-plugin/main/AIOM.zip --allow-root'
+run_cmd 'wp plugin activate aiom --allow-root'
 
-echo "==============================================="
-echo "🏁 SCRIPT FINISHED"
-echo "Dry Run Mode: $DRY_RUN"
-echo "==============================================="
+run_cmd 'wp plugin install https://raw.githubusercontent.com/abjventuresinc/custom-datalayer-mu-plugin/main/AIOS3.zip --allow-root'
+run_cmd 'wp plugin activate aios3 --allow-root'
+
+echo "===============================================" | tee -a "$LOG_FILE"
+echo "🏁 SCRIPT FINISHED — Full log saved to $LOG_FILE" | tee -a "$LOG_FILE"
+echo "Dry Run Mode: $DRY_RUN" | tee -a "$LOG_FILE"
+echo "===============================================" | tee -a "$LOG_FILE"
