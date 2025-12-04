@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -o pipefail
 
 DRY_RUN=false
 LOG_FILE="sop-log-$(date +%Y%m%d-%H%M%S).txt"
@@ -12,47 +12,99 @@ for arg in "$@"; do
     fi
 done
 
+log() {
+    echo "$@" | tee -a "$LOG_FILE"
+}
+
 # Function: run command + log output
 run_cmd() {
-    echo "------------------------------------------------------------" | tee -a "$LOG_FILE"
-    echo "➡️ Command: $1" | tee -a "$LOG_FILE"
-    echo "------------------------------------------------------------" | tee -a "$LOG_FILE"
+    log "------------------------------------------------------------"
+    log "➡️ Command: $1"
+    log "------------------------------------------------------------"
 
     if [ "$DRY_RUN" = true ]; then
-        echo "🟡 DRY RUN: Command NOT executed." | tee -a "$LOG_FILE"
+        log "🟡 DRY RUN: Command NOT executed."
         return
     fi
 
-    # Execute command AND capture output
     OUTPUT=$(eval "$1" 2>&1)
     STATUS=$?
 
     echo "$OUTPUT" | tee -a "$LOG_FILE"
 
     if [ $STATUS -ne 0 ]; then
-        echo "❌ ERROR running: $1" | tee -a "$LOG_FILE"
-        echo "Output:" | tee -a "$LOG_FILE"
-        echo "$OUTPUT" | tee -a "$LOG_FILE"
+        log "❌ ERROR running: $1"
     else
-        echo "✅ SUCCESS" | tee -a "$LOG_FILE"
+        log "✅ SUCCESS"
     fi
 }
 
-echo "===============================================" | tee -a "$LOG_FILE"
-echo "🚀 BEGIN WORDPRESS SOP SCRIPT" | tee -a "$LOG_FILE"
-echo "Dry Run Mode: $DRY_RUN" | tee -a "$LOG_FILE"
-echo "Log File: $LOG_FILE" | tee -a "$LOG_FILE"
-echo "===============================================" | tee -a "$LOG_FILE"
+log "==============================================="
+log "🚀 BEGIN WORDPRESS SOP SCRIPT"
+log "Dry Run Mode: $DRY_RUN"
+log "Log File: $LOG_FILE"
+log "==============================================="
 
 ########################################
-# 1️⃣ Create New Admin & Delete Others
+# 1️⃣ Change to WP root
 ########################################
 run_cmd 'cd /var/www/vhosts/localhost/html'
-run_cmd 'DOMAIN=$(wp option get siteurl --allow-root | sed "s#https\?://##" | sed "s#/.*##")'
-run_cmd 'DOMAIN_NAME=$(echo $DOMAIN | cut -d"." -f1)'
-run_cmd 'PW="gar$(echo $DOMAIN_NAME | cut -c1 | tr "[:lower:]" "[:upper:]")$(echo $DOMAIN_NAME | rev | cut -c1 | tr "[:upper:]" "[:lower:]")3esrx9gc!"'
-run_cmd 'NEW_ID=$(wp user create webadmin webadmin@$DOMAIN --role=administrator --user_pass="$PW" --allow-root --porcelain)'
-run_cmd 'wp user delete $(wp user list --field=ID --allow-root | grep -v "^$NEW_ID$") --reassign=$NEW_ID --allow-root'
+
+########################################
+# 1.1 Compute DOMAIN / PW in main shell
+########################################
+if [ "$DRY_RUN" = false ]; then
+    log "➡️ Computing DOMAIN, DOMAIN_NAME and PW"
+
+    DOMAIN=$(wp option get siteurl --allow-root | sed 's#https\?://##' | sed 's#/.*##')
+    DOMAIN_NAME=$(echo "$DOMAIN" | cut -d'.' -f1)
+    PW="gar$(echo "$DOMAIN_NAME" | cut -c1 | tr '[:lower:]' '[:upper:]')$(echo "$DOMAIN_NAME" | rev | cut -c1 | tr '[:upper:]' '[:lower:]')3esrx9gc!"
+
+    log "DOMAIN=$DOMAIN"
+    log "DOMAIN_NAME=$DOMAIN_NAME"
+else
+    log "🟡 DRY RUN: Would compute DOMAIN, DOMAIN_NAME, PW"
+fi
+
+########################################
+# 1.2 Create / reuse webadmin & delete others
+########################################
+# just for logging
+run_cmd 'wp user get webadmin --field=ID --allow-root'
+
+NEW_ID=""
+
+if [ "$DRY_RUN" = false ]; then
+    USER_EXISTS=$(wp user get webadmin --field=ID --allow-root 2>/dev/null || echo "")
+
+    if [ -z "$USER_EXISTS" ]; then
+        log "🔧 Creating webadmin user..."
+        CREATE_OUTPUT=$(wp user create webadmin "webadmin@$DOMAIN" --role=administrator --user_pass="$PW" --allow-root 2>&1)
+        CREATE_STATUS=$?
+
+        echo "$CREATE_OUTPUT" | tee -a "$LOG_FILE"
+
+        if [ $CREATE_STATUS -ne 0 ]; then
+            log "❌ Failed to create webadmin. Continuing script without user deletion."
+        else
+            NEW_ID=$(echo "$CREATE_OUTPUT" | tail -n1)
+            log "✅ Created webadmin with ID $NEW_ID"
+        fi
+    else
+        log "ℹ️ webadmin already exists — ID: $USER_EXISTS"
+        NEW_ID=$USER_EXISTS
+    fi
+
+    if [ -n "$NEW_ID" ]; then
+        log "🧹 Deleting all other users and reassigning content to webadmin (#$NEW_ID)..."
+        DELETE_CMD="wp user delete \$(wp user list --field=ID --allow-root | grep -v \"^$NEW_ID$\") --reassign=$NEW_ID --allow-root"
+        run_cmd "$DELETE_CMD"
+    else
+        log "⚠️ NEW_ID is empty. Skipping user deletion step."
+    fi
+else
+    log "🟡 DRY RUN: Would create webadmin (if missing) and delete other users."
+fi
 
 ########################################
 # 2️⃣ Regenerate SALTs
@@ -102,16 +154,14 @@ run_cmd 'rm -rf mu-plugins/*'
 run_cmd 'wget -O mu-plugins/abj_datalayers.php https://raw.githubusercontent.com/abjventuresinc/custom-datalayer-mu-plugin/main/abj_datalayers.php'
 
 ########################################
-# 8️⃣ Install + ACTIVATE Wordfence (Improved)
+# 8️⃣ Install + ACTIVATE Wordfence
 ########################################
 run_cmd 'cd /var/www/vhosts/localhost/html'
 run_cmd 'wp plugin install wordfence --allow-root'
-
-# Explicit activation with logging
 run_cmd 'wp plugin activate wordfence --allow-root'
 
 ########################################
-# ✔ Install + Activate AIOM + AIOS3 (Improved)
+# 9️⃣ Install + Activate AIOM + AIOS3
 ########################################
 run_cmd 'wp plugin install https://raw.githubusercontent.com/abjventuresinc/custom-datalayer-mu-plugin/main/AIOM.zip --allow-root'
 run_cmd 'wp plugin activate aiom --allow-root'
@@ -119,7 +169,7 @@ run_cmd 'wp plugin activate aiom --allow-root'
 run_cmd 'wp plugin install https://raw.githubusercontent.com/abjventuresinc/custom-datalayer-mu-plugin/main/AIOS3.zip --allow-root'
 run_cmd 'wp plugin activate aios3 --allow-root'
 
-echo "===============================================" | tee -a "$LOG_FILE"
-echo "🏁 SCRIPT FINISHED — Full log saved to $LOG_FILE" | tee -a "$LOG_FILE"
-echo "Dry Run Mode: $DRY_RUN" | tee -a "$LOG_FILE"
-echo "===============================================" | tee -a "$LOG_FILE"
+log "==============================================="
+log "🏁 SCRIPT FINISHED — Full log saved to $LOG_FILE"
+log "Dry Run Mode: $DRY_RUN"
+log "==============================================="
