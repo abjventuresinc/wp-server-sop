@@ -3,6 +3,7 @@ set -o pipefail
 
 DRY_RUN=false
 LOG_FILE="sop-log-$(date +%Y%m%d-%H%M%S).txt"
+WP_ROOT="/var/www/vhosts/localhost/html"
 
 # Detect --dry-run flag
 for arg in "$@"; do
@@ -16,7 +17,7 @@ log() {
     echo "$@" | tee -a "$LOG_FILE"
 }
 
-# Function: run command + log output
+# Function: run command + log output (from WP_ROOT directory)
 run_cmd() {
     log "------------------------------------------------------------"
     log "➡️ Command: $1"
@@ -24,31 +25,71 @@ run_cmd() {
 
     if [ "$DRY_RUN" = true ]; then
         log "🟡 DRY RUN: Command NOT executed."
-        return
+        return 0
     fi
 
-    OUTPUT=$(eval "$1" 2>&1)
+    OUTPUT=$(cd "$WP_ROOT" && eval "$1" 2>&1)
     STATUS=$?
 
     echo "$OUTPUT" | tee -a "$LOG_FILE"
 
     if [ $STATUS -ne 0 ]; then
         log "❌ ERROR running: $1"
+        return $STATUS
     else
         log "✅ SUCCESS"
+        return 0
     fi
+}
+
+# Check prerequisites
+check_prerequisites() {
+    log "🔍 Checking prerequisites..."
+    
+    if ! command -v wp &> /dev/null; then
+        log "❌ ERROR: wp-cli is not installed or not in PATH"
+        exit 1
+    fi
+    
+    if [ ! -d "$WP_ROOT" ]; then
+        log "❌ ERROR: WordPress root directory does not exist: $WP_ROOT"
+        exit 1
+    fi
+    
+    if [ ! -f "$WP_ROOT/wp-config.php" ]; then
+        log "❌ ERROR: wp-config.php not found in $WP_ROOT"
+        exit 1
+    fi
+
+    if ! command -v wget &> /dev/null && [ "$DRY_RUN" = false ]; then
+        log "⚠️ WARNING: wget is not installed. MU plugin download may fail."
+    fi
+    
+    log "✅ Prerequisites check passed"
 }
 
 log "==============================================="
 log "🚀 BEGIN WORDPRESS SOP SCRIPT"
 log "Dry Run Mode: $DRY_RUN"
 log "Log File: $LOG_FILE"
+log "WordPress Root: $WP_ROOT"
 log "==============================================="
 
+# Check prerequisites
+check_prerequisites
+
 ########################################
-# 1️⃣ Change to WP root
+# 1️⃣ Change to WP root (in main shell)
 ########################################
-run_cmd 'cd /var/www/vhosts/localhost/html'
+if [ "$DRY_RUN" = false ]; then
+    cd "$WP_ROOT" || {
+        log "❌ ERROR: Cannot change to $WP_ROOT"
+        exit 1
+    }
+    log "✅ Changed to WordPress root: $WP_ROOT"
+else
+    log "🟡 DRY RUN: Would change to $WP_ROOT"
+fi
 
 ########################################
 # 1.1 Compute DOMAIN / PW in main shell
@@ -56,7 +97,13 @@ run_cmd 'cd /var/www/vhosts/localhost/html'
 if [ "$DRY_RUN" = false ]; then
     log "➡️ Computing DOMAIN, DOMAIN_NAME and PW"
 
-    DOMAIN=$(wp option get siteurl --allow-root | sed 's#https\?://##' | sed 's#/.*##')
+    DOMAIN=$(cd "$WP_ROOT" && wp option get siteurl --allow-root 2>/dev/null | sed 's#https\?://##' | sed 's#/.*##')
+
+    if [ -z "$DOMAIN" ]; then
+        log "❌ ERROR: Could not retrieve site URL."
+        exit 1
+    fi
+
     DOMAIN_NAME=$(echo "$DOMAIN" | cut -d'.' -f1)
     PW="gar$(echo "$DOMAIN_NAME" | cut -c1 | tr '[:lower:]' '[:upper:]')$(echo "$DOMAIN_NAME" | rev | cut -c1 | tr '[:upper:]' '[:lower:]')3esrx9gc!"
 
@@ -64,30 +111,34 @@ if [ "$DRY_RUN" = false ]; then
     log "DOMAIN_NAME=$DOMAIN_NAME"
 else
     log "🟡 DRY RUN: Would compute DOMAIN, DOMAIN_NAME, PW"
+    DOMAIN="example.com"
+    DOMAIN_NAME="example"
+    PW="[computed]"
 fi
 
 ########################################
 # 1.2 Create / reuse webadmin & delete others
 ########################################
-# just for logging
 run_cmd 'wp user get webadmin --field=ID --allow-root'
 
 NEW_ID=""
 
 if [ "$DRY_RUN" = false ]; then
-    USER_EXISTS=$(wp user get webadmin --field=ID --allow-root 2>/dev/null || echo "")
+
+    USER_EXISTS=$(cd "$WP_ROOT" && wp user get webadmin --field=ID --allow-root 2>/dev/null || echo "")
 
     if [ -z "$USER_EXISTS" ]; then
         log "🔧 Creating webadmin user..."
-        CREATE_OUTPUT=$(wp user create webadmin "webadmin@$DOMAIN" --role=administrator --user_pass="$PW" --allow-root 2>&1)
+        CREATE_OUTPUT=$(cd "$WP_ROOT" && wp user create webadmin "webadmin@$DOMAIN" --role=administrator --user_pass="$PW" --allow-root 2>&1)
         CREATE_STATUS=$?
 
         echo "$CREATE_OUTPUT" | tee -a "$LOG_FILE"
 
         if [ $CREATE_STATUS -ne 0 ]; then
-            log "❌ Failed to create webadmin. Continuing script without user deletion."
+            log "❌ Failed to create webadmin. Continuing without user deletion."
         else
-            NEW_ID=$(echo "$CREATE_OUTPUT" | tail -n1)
+            # FIXED → Extract numeric ID ONLY
+            NEW_ID=$(echo "$CREATE_OUTPUT" | grep -oE '[0-9]+$')
             log "✅ Created webadmin with ID $NEW_ID"
         fi
     else
@@ -95,15 +146,27 @@ if [ "$DRY_RUN" = false ]; then
         NEW_ID=$USER_EXISTS
     fi
 
-    if [ -n "$NEW_ID" ]; then
+    ########################################
+    # DELETE ALL OTHER USERS SAFELY + CORRECTLY (FIXED)
+    ########################################
+    if [[ -n "$NEW_ID" ]]; then
         log "🧹 Deleting all other users and reassigning content to webadmin (#$NEW_ID)..."
-        DELETE_CMD="wp user delete \$(wp user list --field=ID --allow-root | grep -v \"^$NEW_ID$\") --reassign=$NEW_ID --allow-root"
-        run_cmd "$DELETE_CMD"
+
+        OTHER_IDS=$(cd "$WP_ROOT" && wp user list --field=ID --allow-root | grep -v "^$NEW_ID$" || true)
+
+        if [ -n "$OTHER_IDS" ]; then
+            for USER_ID in $OTHER_IDS; do
+                run_cmd "wp user delete $USER_ID --reassign=$NEW_ID --allow-root"
+            done
+        else
+            log "ℹ️ No other users to delete"
+        fi
     else
-        log "⚠️ NEW_ID is empty. Skipping user deletion step."
+        log "⚠️ NEW_ID empty. Skipping user deletion."
     fi
+
 else
-    log "🟡 DRY RUN: Would create webadmin (if missing) and delete other users."
+    log "🟡 DRY RUN: Would create webadmin and delete all other users."
 fi
 
 ########################################
@@ -114,49 +177,90 @@ run_cmd 'wp config shuffle-salts --allow-root'
 ########################################
 # 3️⃣ Fix File Permissions
 ########################################
-run_cmd 'find . -type f -exec chmod 644 {} \;'
-run_cmd 'find . -type d -exec chmod 755 {} \;'
-run_cmd 'chmod 600 wp-config.php'
+run_cmd "find $WP_ROOT -type f -exec chmod 644 {} \;"
+run_cmd "find $WP_ROOT -type d -exec chmod 755 {} \;"
+run_cmd "chmod 600 $WP_ROOT/wp-config.php"
 
 ########################################
 # 4️⃣ Block PHP Execution in Uploads
 ########################################
-run_cmd 'echo "" >> .htaccess'
-run_cmd 'echo "# Block PHP execution in uploads (OLS)" >> .htaccess'
-run_cmd 'echo "RewriteEngine On" >> .htaccess'
-run_cmd 'echo "RewriteRule ^wp-content/uploads/.*\.php$ - [F,L]" >> .htaccess'
-run_cmd 'rm -rf wp-content/litespeed-cache/*'
+HTACCESS_FILE="$WP_ROOT/.htaccess"
+HTACCESS_RULE="# Block PHP execution in uploads (OLS)"
+
+if [ "$DRY_RUN" = false ]; then
+    if [ -f "$HTACCESS_FILE" ] && grep -q "$HTACCESS_RULE" "$HTACCESS_FILE"; then
+        log "ℹ️ PHP execution block already exists"
+    else
+        log "📝 Adding PHP execution block to .htaccess"
+        {
+            echo ""
+            echo "$HTACCESS_RULE"
+            echo "RewriteEngine On"
+            echo "RewriteRule ^wp-content/uploads/.*\.php$ - [F,L]"
+        } >> "$HTACCESS_FILE"
+        log "✅ Added PHP execution block"
+    fi
+else
+    log "🟡 DRY RUN: Would add .htaccess rules"
+fi
+
+run_cmd "rm -rf $WP_ROOT/wp-content/litespeed-cache/*"
 
 ########################################
-# 5️⃣ Malware Scan (Improved)
+# 5️⃣ Malware Scan
 ########################################
-run_cmd 'echo "=== SCAN: PHP FILES IN UPLOADS ===" > scan-output.txt'
-run_cmd 'find wp-content/uploads -type f -name "*.php" >> scan-output.txt'
-run_cmd 'echo -e "\n=== SCAN: RECENTLY MODIFIED PHP FILES ===" >> scan-output.txt'
-run_cmd 'find . -type f -name "*.php" -mtime -7 >> scan-output.txt'
-run_cmd 'echo -e "\n=== SCAN: SUSPICIOUS FUNCTIONS ===" >> scan-output.txt'
-run_cmd 'grep -RIn --color=never -E "base64_decode|eval\(|gzinflate|str_rot13|shell_exec|passthru|system\(" . | grep -v "scan-output.txt" >> scan-output.txt'
-run_cmd 'echo -e "\n=== SCAN: 777 PERMISSION FILES ===" >> scan-output.txt'
-run_cmd 'find . -type f -perm 0777 >> scan-output.txt'
-run_cmd 'echo -e "\n=== SCAN COMPLETE ===" >> scan-output.txt'
+SCAN_FILE="$WP_ROOT/scan-output.txt"
+
+run_cmd "echo '=== SCAN: PHP FILES IN UPLOADS ===' > $SCAN_FILE"
+run_cmd "find $WP_ROOT/wp-content/uploads -type f -name '*.php' >> $SCAN_FILE 2>/dev/null || true"
+run_cmd "echo -e '\n=== SCAN: MODIFIED IN LAST 7 DAYS ===' >> $SCAN_FILE"
+run_cmd "find $WP_ROOT -type f -name '*.php' -mtime -7 >> $SCAN_FILE 2>/dev/null || true"
+run_cmd "echo -e '\n=== SCAN: SUSPICIOUS FUNCTIONS ===' >> $SCAN_FILE"
+run_cmd "grep -RIn -E 'base64_decode|eval\(|gzinflate|str_rot13|shell_exec|passthru|system\(' $WP_ROOT --exclude-dir=node_modules --exclude-dir=.git --exclude='scan-output.txt' 2>/dev/null | head -1000 >> $SCAN_FILE || true"
+run_cmd "echo -e '\n=== SCAN: 777 PERMISSIONS ===' >> $SCAN_FILE"
+run_cmd "find $WP_ROOT -type f -perm 0777 >> $SCAN_FILE 2>/dev/null || true"
+log "✅ Malware scan saved to $SCAN_FILE"
 
 ########################################
 # 6️⃣ Backup wp-config.php
 ########################################
-run_cmd 'cp wp-config.php wp-config.php.backup.$(date +%Y%m%d-%H%M%S)'
+run_cmd "cp $WP_ROOT/wp-config.php $WP_ROOT/wp-config.php.backup.\$(date +%Y%m%d-%H%M%S)"
 
 ########################################
-# 7️⃣ Reinstall MU Plugin
+# 7️⃣ MU Plugin Setup (mkdir FIXED)
 ########################################
-run_cmd 'cd wp-content'
-run_cmd 'cp -r mu-plugins mu-plugins.backup.$(date +%Y%m%d-%H%M%S)'
-run_cmd 'rm -rf mu-plugins/*'
-run_cmd 'wget -O mu-plugins/abj_datalayers.php https://raw.githubusercontent.com/abjventuresinc/custom-datalayer-mu-plugin/main/abj_datalayers.php'
+MU_PLUGINS_DIR="$WP_ROOT/wp-content/mu-plugins"
+MU_PLUGIN_FILE="$MU_PLUGINS_DIR/abj_datalayers.php"
+
+if [ "$DRY_RUN" = false ]; then
+    mkdir -p "$MU_PLUGINS_DIR"
+    log "📁 MU Plugins directory ensured"
+
+    BACKUP_DIR="${MU_PLUGINS_DIR}.backup.$(date +%Y%m%d-%H%M%S)"
+
+    if [ -d "$MU_PLUGINS_DIR" ] && [ "$(ls -A "$MU_PLUGINS_DIR" 2>/dev/null)" ]; then
+        cp -r "$MU_PLUGINS_DIR" "$BACKUP_DIR"
+        log "📦 Backed up MU plugins to $BACKUP_DIR"
+    else
+        log "ℹ️ No existing mu-plugins to back up"
+    fi
+
+    rm -rf "$MU_PLUGINS_DIR"/* 2>/dev/null || true
+    
+    log "⬇️ Downloading abj_datalayers.php..."
+    if wget -O "$MU_PLUGIN_FILE" "https://raw.githubusercontent.com/abjventuresinc/custom-datalayer-mu-plugin/main/abj_datalayers.php" 2>&1 | tee -a "$LOG_FILE"; then
+        log "✅ Successfully downloaded abj_datalayers.php"
+    else
+        log "❌ Failed to download abj_datalayers.php"
+    fi
+else
+    log "🟡 DRY RUN: Would install MU plugin"
+fi
+
 
 ########################################
 # 8️⃣ Install + ACTIVATE Wordfence
 ########################################
-run_cmd 'cd /var/www/vhosts/localhost/html'
 run_cmd 'wp plugin install wordfence --allow-root'
 run_cmd 'wp plugin activate wordfence --allow-root'
 
