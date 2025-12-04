@@ -137,9 +137,17 @@ if [ "$DRY_RUN" = false ]; then
         if [ $CREATE_STATUS -ne 0 ]; then
             log "❌ Failed to create webadmin. Continuing without user deletion."
         else
-            # FIXED → Extract numeric ID ONLY
-            NEW_ID=$(echo "$CREATE_OUTPUT" | grep -oE '[0-9]+$')
-            log "✅ Created webadmin with ID $NEW_ID"
+            # Extract numeric ID from "Success: Created user X." output
+            NEW_ID=$(echo "$CREATE_OUTPUT" | grep -oE 'Created user [0-9]+' | grep -oE '[0-9]+' || echo "$CREATE_OUTPUT" | grep -oE '[0-9]+' | head -1)
+            if [ -z "$NEW_ID" ]; then
+                # Fallback: try to get ID by querying the user we just created
+                NEW_ID=$(cd "$WP_ROOT" && wp user get webadmin --field=ID --allow-root 2>/dev/null || echo "")
+            fi
+            if [ -n "$NEW_ID" ]; then
+                log "✅ Created webadmin with ID $NEW_ID"
+            else
+                log "⚠️ Created webadmin but could not extract ID. User deletion will be skipped."
+            fi
         fi
     else
         log "ℹ️ webadmin already exists — ID: $USER_EXISTS"
@@ -261,17 +269,46 @@ fi
 ########################################
 # 8️⃣ Install + ACTIVATE Wordfence
 ########################################
-run_cmd 'wp plugin install wordfence --allow-root'
-run_cmd 'wp plugin activate wordfence --allow-root'
+if [ "$DRY_RUN" = false ]; then
+    if cd "$WP_ROOT" && wp plugin is-installed wordfence --allow-root 2>/dev/null; then
+        log "ℹ️ Wordfence already installed, activating..."
+        run_cmd 'wp plugin activate wordfence --allow-root'
+    else
+        run_cmd 'wp plugin install wordfence --allow-root'
+        run_cmd 'wp plugin activate wordfence --allow-root'
+    fi
+else
+    run_cmd 'wp plugin install wordfence --allow-root'
+    run_cmd 'wp plugin activate wordfence --allow-root'
+fi
 
 ########################################
 # 9️⃣ Install + Activate AIOM + AIOS3
 ########################################
-run_cmd 'wp plugin install https://raw.githubusercontent.com/abjventuresinc/custom-datalayer-mu-plugin/main/AIOM.zip --allow-root'
-run_cmd 'wp plugin activate aiom --allow-root'
-
-run_cmd 'wp plugin install https://raw.githubusercontent.com/abjventuresinc/custom-datalayer-mu-plugin/main/AIOS3.zip --allow-root'
-run_cmd 'wp plugin activate aios3 --allow-root'
+if [ "$DRY_RUN" = false ]; then
+    # Check and install/activate AIOM
+    if cd "$WP_ROOT" && wp plugin is-installed all-in-one-wp-migration --allow-root 2>/dev/null; then
+        log "ℹ️ AIOM already installed, activating..."
+        run_cmd 'wp plugin activate all-in-one-wp-migration --allow-root'
+    else
+        run_cmd 'wp plugin install https://raw.githubusercontent.com/abjventuresinc/custom-datalayer-mu-plugin/main/AIOM.zip --force --allow-root'
+        run_cmd 'wp plugin activate all-in-one-wp-migration --allow-root'
+    fi
+    
+    # Check and install/activate AIOS3
+    if cd "$WP_ROOT" && wp plugin is-installed all-in-one-wp-migration-s3-extension --allow-root 2>/dev/null; then
+        log "ℹ️ AIOS3 already installed, activating..."
+        run_cmd 'wp plugin activate all-in-one-wp-migration-s3-extension --allow-root'
+    else
+        run_cmd 'wp plugin install https://raw.githubusercontent.com/abjventuresinc/custom-datalayer-mu-plugin/main/AIOS3.zip --force --allow-root'
+        run_cmd 'wp plugin activate all-in-one-wp-migration-s3-extension --allow-root'
+    fi
+else
+    run_cmd 'wp plugin install https://raw.githubusercontent.com/abjventuresinc/custom-datalayer-mu-plugin/main/AIOM.zip --allow-root'
+    run_cmd 'wp plugin activate aiom --allow-root'
+    run_cmd 'wp plugin install https://raw.githubusercontent.com/abjventuresinc/custom-datalayer-mu-plugin/main/AIOS3.zip --allow-root'
+    run_cmd 'wp plugin activate aios3 --allow-root'
+fi
 
 log "==============================================="
 log "🏁 SCRIPT FINISHED — Full log saved to $LOG_FILE"
