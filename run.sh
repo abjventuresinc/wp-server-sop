@@ -212,6 +212,31 @@ else
     log "🟡 DRY RUN: Would add .htaccess rules"
 fi
 
+########################################
+# 4️⃣.1 Block public access to debug.log
+########################################
+DEBUG_HTACCESS="$WP_ROOT/wp-content/.htaccess"
+DEBUG_RULE="# Block public access to debug.log"
+
+if [ "$DRY_RUN" = false ]; then
+    if [ -f "$DEBUG_HTACCESS" ] && grep -q "$DEBUG_RULE" "$DEBUG_HTACCESS"; then
+        log "ℹ️ debug.log protection already exists"
+    else
+        log "🛡️ Blocking public access to wp-content/debug.log"
+        {
+            echo ""
+            echo "$DEBUG_RULE"
+            echo "<Files \"debug.log\">"
+            echo "  Require all denied"
+            echo "</Files>"
+        } >> "$DEBUG_HTACCESS"
+        log "✅ debug.log is no longer publicly accessible"
+    fi
+else
+    log "🟡 DRY RUN: Would block public access to debug.log"
+fi
+
+
 run_cmd "rm -rf $WP_ROOT/wp-content/litespeed-cache/*"
 
 ########################################
